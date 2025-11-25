@@ -75,7 +75,7 @@ app.post("/incoming", (req, res) => {
   const twiml = `
     <Response>
       <Connect>
-        <Stream url="wss://${HOSTNAME}" />
+        <Stream url="wss://${HOSTNAME}/" />
       </Connect>
     </Response>
   `;
