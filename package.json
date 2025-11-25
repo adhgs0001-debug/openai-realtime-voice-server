@@ -1,13 +1,10 @@
 {
-  "name": "realtime-voice-server",
-  "version": "1.0.0",
-  "main": "server.js",
-  "type": "module",
+  "type":"module",
   "dependencies": {
     "express": "^4.18.2",
     "ws": "^8.13.0",
     "dotenv": "^16.0.3",
     "openai": "^4.0.0",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.0"
   }
 }
