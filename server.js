@@ -59,13 +59,11 @@ wss.on("connection", (ws) => {
         const audioData = data.media.payload;
 
         const response = await client.audio.speech.create({
-          model: "gpt-4o-realtime-preview",
-          voice: "alloy",
-          input: "Hi, how can I help you?",
-          audio: {
-            format: "wav"
-          }
-        });
+  model: "gpt-4o-realtime-preview-2024-12-17",
+  voice: "alloy",
+  input: "Hi, how can I help you?",
+  audio: { format: "wav" }
+});
 
         ws.send(
           JSON.stringify({
