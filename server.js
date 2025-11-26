@@ -1,174 +1,204 @@
+// server.js — FINAL FULL VERSION
 import express from "express";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
+import { WebSocketServer } from "ws";
 import OpenAI from "openai";
+import { v4 as uuidv4 } from "uuid";
 
 dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json());
 
-// Ensure memory + logging folders exist
-const CALL_LOG_PATH = process.env.CALL_LOG_PATH || "./call_logs";
+// ----- Config -----
+const PORT = process.env.PORT || 3000;
+const HOSTNAME = process.env.RENDER_EXTERNAL_HOSTNAME || "localhost:3000";
+
 const MEMORY_PATH = process.env.MEMORY_PATH || "./memory";
+const LOG_PATH = process.env.CALL_LOG_PATH || "./call_logs";
 
-if (!fs.existsSync(CALL_LOG_PATH)) fs.mkdirSync(CALL_LOG_PATH);
-if (!fs.existsSync(MEMORY_PATH)) fs.mkdirSync(MEMORY_PATH);
+if (!fs.existsSync(MEMORY_PATH)) fs.mkdirSync(MEMORY_PATH, { recursive: true });
+if (!fs.existsSync(LOG_PATH)) fs.mkdirSync(LOG_PATH, { recursive: true });
 
-// ========= OpenAI Client ==========
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ========= Server Boot ============
-const PORT = process.env.PORT || 10000;
+// ----- Helpers -----
+function writeCallLog(callId, obj) {
+  const file = path.join(LOG_PATH, `${callId}.json`);
+  fs.appendFileSync(file, JSON.stringify({ ts: Date.now(), ...obj }) + "\n");
+}
+function saveMemory(callId, obj) {
+  const file = path.join(MEMORY_PATH, `${callId}.json`);
+  let mem = [];
+  if (fs.existsSync(file)) mem = JSON.parse(fs.readFileSync(file));
+  mem.push(obj);
+  fs.writeFileSync(file, JSON.stringify(mem, null, 2));
+}
+function getMemory(callId) {
+  const file = path.join(MEMORY_PATH, `${callId}.json`);
+  if (!fs.existsSync(file)) return [];
+  return JSON.parse(fs.readFileSync(file));
+}
 
-const httpServer = app.listen(PORT, () => {
-  console.log(`Realtime AI Voice Server running on port ${PORT}`);
-});
+function classifyIntent(text) {
+  const t = text.toLowerCase();
+  if (/\b(schedule|interview|book|appointment)\b/.test(t)) return "schedule_interview";
+  if (/\b(hours|when|open|close|location|address)\b/.test(t)) return "info";
+  if (/\b(hi|hello|hey)\b/.test(t)) return "greeting";
+  return "unknown";
+}
 
-// ========= WebSocket Bridge =========
-import { WebSocketServer } from "ws";
-const wss = new WebSocketServer({ server: httpServer });
-
-// Store memory in RAM (persisted after each turn)
-let memory = [];
-
-// ========= Helper Functions ==========
-
-function logCallEvent(callId, event) {
-  const logFile = path.join(CALL_LOG_PATH, `${callId}.json`);
-
-  let existing = [];
-  if (fs.existsSync(logFile)) {
-    existing = JSON.parse(fs.readFileSync(logFile));
+function emotionToTone(emotion) {
+  switch ((emotion || "").toLowerCase()) {
+    case "angry": return "calm and steady";
+    case "sad": return "soft and caring";
+    case "excited": return "upbeat and energetic";
+    default: return "friendly and natural";
   }
-
-  existing.push(event);
-  fs.writeFileSync(logFile, JSON.stringify(existing, null, 2));
 }
 
-function saveMemory() {
-  fs.writeFileSync(
-    path.join(MEMORY_PATH, "memory.json"),
-    JSON.stringify(memory, null, 2)
-  );
-}
-
-// ========= Twilio Incoming Call (returns TwiML) =========
+// =========== TWILIO WEBHOOK (incoming call) ==========
 app.post("/incoming", (req, res) => {
-  const HOST = process.env.RENDER_EXTERNAL_HOSTNAME;
+  const callId = req.body.CallSid || uuidv4();
+  writeCallLog(callId, { event: "incoming_call", from: req.body.From });
+
+  saveMemory(callId, { role: "system", content: "Call started" });
 
   const twiml = `
     <Response>
       <Start>
-        <Stream url="wss://${HOST}" />
+        <Stream url="wss://${HOSTNAME}/stream"/>
       </Start>
       <Say>Hello! Connecting you now.</Say>
     </Response>
   `;
 
   res.set("Content-Type", "text/xml");
-  return res.send(twiml);
+  res.send(twiml);
 });
 
-// ========= WebSocket Handling (Twilio <Stream>) ==========
+app.get("/", (req, res) => res.send("Realtime AI Voice Server is Running"));
 
-wss.on("connection", async (ws) => {
-  console.log("📞 Twilio connected to WebSocket stream.");
+// ------- START HTTP SERVER -------
+const server = app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
 
-  let callId = `call_${Date.now()}`;
+// -----------------------------------------------------------
+// WEBSOCKET UPGRADE — REQUIRED FOR RENDER + TWILIO <Stream>
+// -----------------------------------------------------------
+const wss = new WebSocketServer({ noServer: true });
 
-  // Each call gets a dedicated OpenAI Realtime session
-  const session = await client.realtime.sessions.create({
-    modalities: ["audio", "text"],
-    audio: {
-      voice: "alloy",
-      format: "wav",
-    },
-    instructions: `
-      You are Jessica, a friendly real human receptionist.
-      • Speak naturally
-      • Interrupt when the user interrupts
-      • Match the user's tone (emotional tuning)
-      • Keep track of memory details: name, appointment, reason for calling
-      • Route calls when needed (booking, support, emergencies)
-    `,
-  });
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/stream") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
 
-  // Stream audio from OpenAI → Twilio WebSocket
-  session.on("audio.delta", (delta) => {
-    ws.send(
-      JSON.stringify({
-        event: "assistant_audio",
-        audio: delta,
-      })
-    );
-  });
+// -----------------------------------------------------------
+// WEBSOCKET CONNECTION HANDLER
+// -----------------------------------------------------------
+wss.on("connection", (ws, req) => {
+  const callId = uuidv4();
+  console.log("WS connected", callId);
 
-  ws.on("message", async (msg) => {
-    let data;
+  writeCallLog(callId, { event: "ws_connect" });
+
+  let lastEmotion = "neutral";
+
+  async function handleUserSpeech(text, isFinal, emotion) {
+    if (emotion) lastEmotion = emotion;
+    const memory = getMemory(callId);
+
+    const intent = classifyIntent(text);
+    const tone = emotionToTone(lastEmotion);
+
+    saveMemory(callId, { role: "user", content: text });
+    writeCallLog(callId, { event: "user_speech", text, isFinal });
+
+    const systemPrompt = `
+You are Jessica, a warm, human-sounding receptionist.
+Speak in short natural sentences.
+Tone style: ${tone}.
+If caller wants to schedule, guide them to provide:
+- full name
+- availability
+- phone number.
+If caller wants info, answer concisely.
+Never say you're an AI.
+Allow interruptions, stay conversational.
+`;
 
     try {
-      data = JSON.parse(msg.toString());
-    } catch (e) {
-      console.log("❌ Bad JSON from Twilio:", msg.toString());
-      return;
-    }
-
-    // ========== Twilio EVENT HANDLING ==========
-
-    if (data.event === "start") {
-      console.log("▶️ Stream started.");
-      logCallEvent(callId, { type: "call_started", ts: Date.now() });
-    }
-
-    if (data.event === "stop") {
-      console.log("⏹ Stream stopped.");
-      logCallEvent(callId, { type: "call_ended", ts: Date.now() });
-      saveMemory();
-    }
-
-    // Twilio sends audio packets as base64 — we forward to OpenAI
-    if (data.event === "media") {
-      const audio_b64 = data.media.payload;
-
-      session.input_audio.send({
-        audio: audio_b64,
-      });
-    }
-
-    // Twilio STT results (this is the KEY)
-    if (data.event === "speech") {
-      const text = data.speech.text;
-      const final = data.speech.is_final;
-
-      console.log("👤 Caller:", text);
-
-      logCallEvent(callId, {
-        type: "user_speech",
-        text,
-        ts: Date.now(),
+      const resp = await client.responses.create({
+        model: "gpt-4o-realtime-preview",
+        modalities: ["audio", "text"],
+        audio: { voice: "alloy", format: "wav" },
+        input: [
+          { role: "system", content: systemPrompt },
+          ...memory.map(m => ({ role: m.role, content: m.content })),
+          { role: "user", content: text }
+        ]
       });
 
-      if (final) {
-        // memory update
-        memory.push({ ts: Date.now(), text });
-        saveMemory();
+      const assistantText = resp.output
+        ?.filter(o => o.type === "output_text")
+        ?.map(o => o.content)
+        ?.join(" ") || "";
 
-        // NLU routing example
-        if (text.includes("appointment")) {
-          session.input_text.send("The caller wants an appointment.");
-        }
+      saveMemory(callId, { role: "assistant", content: assistantText });
+      writeCallLog(callId, { event: "assistant_text", assistantText });
 
-        if (text.includes("emergency")) {
-          session.input_text.send("This is urgent. Respond seriously.");
-        }
-
-        // Forward to OpenAI to speak
-        session.input_text.send(text);
+      // Extract audio response
+      const audioItem = resp.output.find(o => o.type === "output_audio");
+      if (audioItem?.audio) {
+        ws.send(JSON.stringify({
+          event: "assistant_audio",
+          audio: audioItem.audio
+        }));
       }
+
+    } catch (err) {
+      console.error("OpenAI error:", err);
+      writeCallLog(callId, { event: "openai_error", error: String(err) });
+
+      ws.send(JSON.stringify({
+        event: "assistant_text",
+        text: "Sorry — I'm having trouble responding."
+      }));
     }
+  }
+
+  ws.on("message", async (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+
+      if (data.event === "media") {
+        // Twilio sends audio bytes, but your setup requires text-only.
+        // Ignore raw audio if present.
+      }
+
+      if (data.event === "user_speech") {
+        await handleUserSpeech(data.text, data.isFinal, data.emotion);
+      }
+
+      if (data.event === "stop") {
+        writeCallLog(callId, { event: "call_end" });
+      }
+
+    } catch (err) {
+      console.warn("WS parse error", err);
+    }
+  });
+
+  ws.on("close", () => {
+    writeCallLog(callId, { event: "ws_disconnect" });
+    console.log("WS closed", callId);
   });
 });
