@@ -1,23 +1,28 @@
 import express from "express";
 import dotenv from "dotenv";
 import { WebSocketServer } from "ws";
-import { v4 as uuidv4 } from "uuid";
 import OpenAI from "openai";
 
 dotenv.config();
+
+// -------------------------
+// EXPRESS APP
+// -------------------------
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ====== TWILIO INCOMING CALL ======
+// Twilio webhook → return TwiML that opens websocket stream
 app.post("/incoming", (req, res) => {
+  console.log("📞 Incoming call from:", req.body.From);
+
   const twiml = `
     <Response>
       <Start>
         <Stream url="wss://${process.env.RENDER_EXTERNAL_HOSTNAME}/stream" />
       </Start>
-      <Say>Hi, I’m Jessica. How can I help?</Say>
+      <Say>Hi, I'm Jessica. How can I help you today?</Say>
     </Response>
   `;
 
@@ -25,120 +30,144 @@ app.post("/incoming", (req, res) => {
   res.send(twiml);
 });
 
-// ============ SERVER & WS ============
+// -------------------------
+// SERVER + WEBSOCKET
+// -------------------------
+
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
-});
+const server = app.listen(PORT, () =>
+  console.log("🚀 Server running on port", PORT)
+);
 
 const wss = new WebSocketServer({ server, path: "/stream" });
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ========= PER-CALL STATE =========
-const calls = {};
+// -------------------------
+// AUDIO BUFFER (1.5-second safe batching)
+// -------------------------
+let audioBuffer = [];
+let lastProcessTime = Date.now();
+const BATCH_TIME = 1500; // ms
 
-function initCall(callId) {
-  calls[callId] = {
-    audioBuffer: [],      // Collect incoming Twilio audio
-    memory: [],           // Conversation context
-    lastProcessTime: 0    // Rate limit Whisper requests
-  };
-}
-
-function addMemory(callId, role, text) {
-  calls[callId].memory.push({ role, content: text });
-}
-
-function getMemory(callId) {
-  return calls[callId].memory;
-}
-
-
-// ========= TRANSCRIBE COLLECTED AUDIO ======
-async function transcribeChunk(buffer) {
-  const audio = Buffer.concat(buffer);
-
-  const result = await client.audio.transcriptions.create({
-    file: audio,
-    model: "whisper-1",
-    response_format: "text"
+// -------------------------
+// SAFE FALLBACK RESPONSE
+// -------------------------
+async function fallbackAudio() {
+  const resp = await openai.audio.speech.create({
+    model: "gpt-4o-mini-tts",
+    voice: "alloy",
+    input: "Sorry, I didn't catch that. Could you repeat it?"
   });
 
-  return result;
+  return Buffer.from(await resp.arrayBuffer()).toString("base64");
 }
 
+// -------------------------
+// TRANSCRIBE CHUNK (safe try/catch)
+// -------------------------
+async function transcribeChunk(base64wav) {
+  try {
+    const resp = await openai.audio.transcriptions.create({
+      file: Buffer.from(base64wav, "base64"),
+      model: "whisper-1"
+    });
+    return resp.text || "";
+  } catch (err) {
+    console.error("⚠️ Whisper transcription failed:", err);
+    return null; // return null so fallback is used
+  }
+}
 
-// ========= HANDLE TWILIO STREAM ==========
+// -------------------------
+// SEND TEXT → SPEECH
+// -------------------------
+async function ttsResponse(text) {
+  const resp = await openai.audio.speech.create({
+    model: "gpt-4o-mini-tts",
+    voice: "alloy",
+    input: text
+  });
+  return Buffer.from(await resp.arrayBuffer()).toString("base64");
+}
+
+// -------------------------
+// GENERATE AI RESPONSE
+// -------------------------
+async function aiResponse(userText) {
+  const resp = await openai.responses.create({
+    model: "gpt-4o-mini",
+    input: `You are Jessica, a friendly phone assistant. User said: ${userText}`
+  });
+
+  return resp.output_text;
+}
+
+// -------------------------
+// WEBSOCKET CONNECTION
+// -------------------------
 wss.on("connection", (ws) => {
-  console.log("🔌 Twilio Stream Connected");
-
-  const callId = uuidv4();
-  initCall(callId);
+  console.log("🔌 Twilio WebSocket connected");
 
   ws.on("message", async (msg) => {
     const data = JSON.parse(msg.toString());
 
-    if (data.event === "media") {
-      const packet = Buffer.from(data.media.payload, "base64");
-      calls[callId].audioBuffer.push(packet);
-
-      const now = Date.now();
-
-      // process every 1.2 seconds
-      if (now - calls[callId].lastProcessTime > 1200) {
-        calls[callId].lastProcessTime = now;
-
-        const chunk = [...calls[callId].audioBuffer];
-        calls[callId].audioBuffer = [];
-
-        try {
-          const text = await transcribeChunk(chunk);
-
-          console.log("👂 Caller:", text);
-          addMemory(callId, "user", text);
-
-          const response = await client.responses.create({
-            model: "gpt-4o-realtime-preview-2024-12-17",
-            modalities: ["text", "audio"],
-            audio: { voice: "alloy", format: "wav" },
-            input: [
-              { role: "system", content: "You are Jessica, a warm human receptionist." },
-              ...getMemory(callId),
-              { role: "user", content: text }
-            ]
-          });
-
-          // Extract audio
-          const audioChunk = response.output.find(o => o.type === "audio");
-
-          if (audioChunk) {
-            ws.send(JSON.stringify({
-              event: "media",
-              media: { payload: audioChunk.audio }
-            }));
-          }
-
-          // Save assistant text memory
-          const assistantText = response.output
-            .filter(o => o.type === "output_text")
-            .map(o => o.content)
-            .join(" ");
-
-          addMemory(callId, "assistant", assistantText);
-
-        } catch (err) {
-          console.error("❌ Processing error:", err.message);
-        }
-      }
-    }
-
     if (data.event === "start") {
       console.log("▶️ Stream started");
+      return;
     }
 
     if (data.event === "stop") {
       console.log("⏹ Stream stopped");
+      return;
+    }
+
+    if (data.event === "media") {
+      audioBuffer.push(data.media.payload);
+
+      // Process every BATCH_TIME ms
+      if (Date.now() - lastProcessTime < BATCH_TIME) return;
+      lastProcessTime = Date.now();
+
+      const chunk = audioBuffer.join("");
+      audioBuffer = []; // reset buffer
+
+      console.log("🎤 Processing batch of audio...");
+
+      // -------------------------
+      // TRANSCRIBE
+      // -------------------------
+      const text = await transcribeChunk(chunk);
+
+      if (!text || text.trim() === "") {
+        console.log("⚠️ Empty/failed transcription → sending fallback");
+        const fb = await fallbackAudio();
+        ws.send(JSON.stringify({ event: "media", media: { payload: fb } }));
+        return;
+      }
+
+      console.log("🗣 User said:", text);
+
+      // -------------------------
+      // AI RESPONSE
+      // -------------------------
+      const reply = await aiResponse(text);
+      console.log("🤖 AI:", reply);
+
+      // -------------------------
+      // SYNTHESIZE AUDIO
+      // -------------------------
+      const audio = await ttsResponse(reply);
+
+      // -------------------------
+      // SEND AUDIO BACK TO TWILIO
+      // -------------------------
+      ws.send(
+        JSON.stringify({
+          event: "media",
+          media: { payload: audio }
+        })
+      );
     }
   });
 });
